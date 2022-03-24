@@ -1,10 +1,12 @@
 //! Bindings to the [coinapi](https://www.coinapi.io/jq) cryptocurrency api
 //! Currently only the Market Data REST API is supported
-use chrono::{Date, DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+
+const API_KEY_ENV_NAME: &str = "COINAPI_KEY";
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -16,10 +18,27 @@ pub enum Error {
 
     #[error("json decode {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("asset not found {0}")]
+    AssetNotFound(String),
+
+    #[error("api key not set (`{}` env)", API_KEY_ENV_NAME)]
+    ApiKeyNotSet,
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub struct Coinapi {
     key: String,
+}
+
+impl Coinapi {
+    /// Tries to create a coinapi connection using the `COINAPI_KEY` as the api key
+    pub fn try_from_env() -> Result<Coinapi, Error> {
+        let key = std::env::var(API_KEY_ENV_NAME).map_err(|_| Error::ApiKeyNotSet)?;
+        Ok(Coinapi { key })
+    }
 }
 
 /// The name of an asset such as `BTC`, `UTD`, `ETH`.
@@ -169,10 +188,10 @@ impl Period {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TimeseriesData(pub Vec<TimeseriesDatum>);
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TimeseriesDatum {
     #[serde(deserialize_with = "de_date_time")]
     pub time_period_start: DateTime<Utc>,
@@ -211,10 +230,10 @@ where
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Exchanges(pub Vec<Exchange>);
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Exchange {
     pub exchange_id: String,
     pub website: String,
@@ -269,14 +288,6 @@ where
     })
 }
 
-fn de_date<'de, D>(d: D) -> Result<NaiveDate, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(d)?;
-    Ok(NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)?)
-}
-
 fn de_int_bool<'de, D>(d: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
@@ -288,50 +299,49 @@ where
     }
 }
 
-#[derive(Deserialize)]
-pub struct Assets(pub Vec<Asset>);
+pub type Assets = Vec<Asset>;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Asset {
-    asset_id: String,
-    name: String,
+    pub asset_id: String,
+    pub name: String,
     #[serde(deserialize_with = "de_int_bool")]
-    type_is_crypto: bool,
+    pub type_is_crypto: bool,
 
     #[serde(default)]
     #[serde(deserialize_with = "de_date_option")]
-    data_start: Option<NaiveDate>,
+    pub data_start: Option<NaiveDate>,
     #[serde(default)]
     #[serde(deserialize_with = "de_date_option")]
-    data_end: Option<NaiveDate>,
+    pub data_end: Option<NaiveDate>,
 
     #[serde(default)]
     #[serde(deserialize_with = "de_date_time_option")]
-    data_quote_start: Option<DateTime<Utc>>,
+    pub data_quote_start: Option<DateTime<Utc>>,
     #[serde(default)]
     #[serde(deserialize_with = "de_date_time_option")]
-    data_quote_end: Option<DateTime<Utc>>,
+    pub data_quote_end: Option<DateTime<Utc>>,
 
     #[serde(default)]
     #[serde(deserialize_with = "de_date_time_option")]
-    data_orderbook_start: Option<DateTime<Utc>>,
+    pub data_orderbook_start: Option<DateTime<Utc>>,
     #[serde(deserialize_with = "de_date_time_option")]
     #[serde(default)]
-    data_orderbook_end: Option<DateTime<Utc>>,
+    pub data_orderbook_end: Option<DateTime<Utc>>,
 
     #[serde(default)]
     #[serde(deserialize_with = "de_date_time_option")]
-    data_trade_start: Option<DateTime<Utc>>,
+    pub data_trade_start: Option<DateTime<Utc>>,
     #[serde(default)]
     #[serde(deserialize_with = "de_date_time_option")]
-    data_trade_end: Option<DateTime<Utc>>,
+    pub data_trade_end: Option<DateTime<Utc>>,
 
-    data_symbols_count: usize,
-    volume_1hrs_usd: f64,
-    volume_1day_usd: f64,
-    volume_1mth_usd: f64,
+    pub data_symbols_count: usize,
+    pub volume_1hrs_usd: f64,
+    pub volume_1day_usd: f64,
+    pub volume_1mth_usd: f64,
     #[serde(default)]
-    price_usd: Option<f64>,
+    pub price_usd: Option<f64>,
 }
 
 impl Coinapi {
@@ -343,7 +353,7 @@ impl Coinapi {
     ) -> Result<String, Error> {
         let url = reqwest::Url::parse_with_params(
             &format!("https://rest.coinapi.io/v1/{}", route.as_ref()),
-            params.into_iter(),
+            params,
         )?;
         let resp = reqwest::get(url).await?;
         let json = resp.text().await?;
@@ -379,6 +389,42 @@ impl Coinapi {
                 ]
                 .into_iter(),
             )
+            .await?;
+
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Queries the `assets` endpoint to discover all assets supported by coinapi
+    pub async fn assets(&self) -> Result<Assets, Error> {
+        let json = self.get("assets", [].into_iter()).await?;
+
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Queries the `assets/{asset}` endpoint for which assets are available in coinapi
+    ///
+    pub async fn asset(&self, asset: &str) -> Result<Asset, Error> {
+        let json = self.get(format!("assets/{asset}"), [].into_iter()).await?;
+
+        let mut assets: Assets = serde_json::from_str(&json)?;
+        match assets.len() {
+            0 => Err(Error::AssetNotFound(asset.to_owned())),
+            1 => Ok(assets.remove(0)),
+            _ => Err(Error::Other(format!(
+                "Api returned mutiple assets during a single request for {asset}: {:?}",
+                assets
+            ))),
+        }
+    }
+
+    /// Queries the `assets?filter_asset_id={filter}` endpoint for which assets are available in
+    /// coinapi based on a user defined filter.
+    ///
+    /// The filter must be comma or semicolon delimited asset identifiers.
+    /// Ex: `BTC;ETH`
+    pub async fn assets_matching(&self, filter: &str) -> Result<Assets, Error> {
+        let json = self
+            .get(format!("assets?filter_asset_id={filter}"), [].into_iter())
             .await?;
 
         Ok(serde_json::from_str(&json)?)
@@ -466,5 +512,19 @@ mod tests {
     fn exchanges_format() {
         let _: Exchanges =
             serde_json::from_str(include_str!("../test_files/exchanges.json")).unwrap();
+    }
+
+    fn crate_ci_api() -> Option<Coinapi> {
+        if cfg!(ci) {
+            // Only run on CI so we don't eat up api requests when spamming local testing
+            Some(Coinapi::try_from_env().expect("key missing on ci"))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn assets() {
+        if let Some(api) = crate_ci_api() {}
     }
 }
