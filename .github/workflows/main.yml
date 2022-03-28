@@ -16,7 +16,7 @@ jobs:
         rustup update ${{ matrix.rust }} && rustup default ${{ matrix.rust }}
         cargo test
       env:
-        RUSTFLAGS: "--cfg ci"
+        CI_TEST: true
         COINAPI_KEY: ${{ secrets.COINAPI_KEY }}
 
   rustfmt:

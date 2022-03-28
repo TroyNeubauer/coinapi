@@ -12,3 +12,6 @@ serde_json = "1.0"
 lazy_static = "1.4"
 chrono = "0.4"
 reqwest = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1.17", features = ["full"] }

@@ -3,23 +3,26 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use thiserror::Error;
 
 const API_KEY_ENV_NAME: &str = "COINAPI_KEY";
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("url parse {0}")]
+    #[error("url parse: {0}")]
     UrlParse(#[from] url::ParseError),
 
     #[error("reqwest {0}")]
     Reqwest(#[from] reqwest::Error),
 
-    #[error("json decode {0}")]
+    #[error("coinapi: {0}")]
+    Api(String),
+
+    #[error("json decode: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("asset not found {0}")]
+    #[error("asset not found: {0}")]
     AssetNotFound(String),
 
     #[error("api key not set (`{}` env)", API_KEY_ENV_NAME)]
@@ -31,13 +34,17 @@ pub enum Error {
 
 pub struct Coinapi {
     key: String,
+    client: reqwest::Client,
 }
 
 impl Coinapi {
     /// Tries to create a coinapi connection using the `COINAPI_KEY` as the api key
     pub fn try_from_env() -> Result<Coinapi, Error> {
         let key = std::env::var(API_KEY_ENV_NAME).map_err(|_| Error::ApiKeyNotSet)?;
-        Ok(Coinapi { key })
+        Ok(Coinapi {
+            key,
+            client: reqwest::Client::new(),
+        })
     }
 }
 
@@ -345,20 +352,41 @@ pub struct Asset {
 }
 
 impl Coinapi {
-    /// Sends a get request to the server with api v1 at `route` with params as URL parameters
-    async fn get<'k, 'v>(
+    /// Sends a get request to the server with api v1 at `route` with params as URL parameters.
+    ///
+    /// Decodes the json responce into `T`
+    async fn get<'k, 'v, 'de, T>(
         &self,
         route: impl AsRef<str>,
         params: impl Iterator<Item = (&'k str, &'v str)>,
-    ) -> Result<String, Error> {
+    ) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+    {
         let url = reqwest::Url::parse_with_params(
             &format!("https://rest.coinapi.io/v1/{}", route.as_ref()),
             params,
         )?;
-        let resp = reqwest::get(url).await?;
+        println!("Sending {url}");
+        let resp = self
+            .client
+            .get(url)
+            .header("X-CoinAPI-Key", &self.key)
+            .send()
+            .await?;
+
         let json = resp.text().await?;
 
-        Ok(json)
+        #[derive(Deserialize)]
+        struct ErrorRes {
+            error: String,
+        }
+
+        if let Ok(err) = serde_json::from_str::<ErrorRes>(&json) {
+            Err(Error::Api(err.error))
+        } else {
+            Ok(serde_json::from_str(&json)?)
+        }
     }
 
     /// Queries the `exchangerate/{asset_id_base}/{asset_id_quote}/history` endpoint for historical
@@ -378,7 +406,7 @@ impl Coinapi {
         let start = start.to_rfc3339();
         let end = end.to_rfc3339();
         let limit = limit.to_string();
-        let json = self
+        Ok(self
             .get(
                 format!("exchangerate/{base}/{quote}/history"),
                 [
@@ -389,24 +417,19 @@ impl Coinapi {
                 ]
                 .into_iter(),
             )
-            .await?;
-
-        Ok(serde_json::from_str(&json)?)
+            .await?)
     }
 
     /// Queries the `assets` endpoint to discover all assets supported by coinapi
     pub async fn assets(&self) -> Result<Assets, Error> {
-        let json = self.get("assets", [].into_iter()).await?;
-
-        Ok(serde_json::from_str(&json)?)
+        Ok(self.get("assets", [].into_iter()).await?)
     }
 
     /// Queries the `assets/{asset}` endpoint for which assets are available in coinapi
     ///
     pub async fn asset(&self, asset: &str) -> Result<Asset, Error> {
-        let json = self.get(format!("assets/{asset}"), [].into_iter()).await?;
+        let mut assets: Assets = self.get(format!("assets/{asset}"), [].into_iter()).await?;
 
-        let mut assets: Assets = serde_json::from_str(&json)?;
         match assets.len() {
             0 => Err(Error::AssetNotFound(asset.to_owned())),
             1 => Ok(assets.remove(0)),
@@ -423,11 +446,10 @@ impl Coinapi {
     /// The filter must be comma or semicolon delimited asset identifiers.
     /// Ex: `BTC;ETH`
     pub async fn assets_matching(&self, filter: &str) -> Result<Assets, Error> {
-        let json = self
+        let assets = self
             .get(format!("assets?filter_asset_id={filter}"), [].into_iter())
             .await?;
-
-        Ok(serde_json::from_str(&json)?)
+        Ok(assets)
     }
 }
 
@@ -515,7 +537,7 @@ mod tests {
     }
 
     fn crate_ci_api() -> Option<Coinapi> {
-        if cfg!(ci) {
+        if std::env::var("CI_TEST").is_ok() {
             // Only run on CI so we don't eat up api requests when spamming local testing
             Some(Coinapi::try_from_env().expect("key missing on ci"))
         } else {
@@ -523,8 +545,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn assets() {
-        if let Some(api) = crate_ci_api() {}
+    #[tokio::test]
+    async fn assets() {
+        if let Some(api) = crate_ci_api() {
+            let _ = api.assets().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn timeseries_data() {
+        if let Some(api) = crate_ci_api() {
+            //period_id=1MIN&time_start=2016-01-01T00:00:00&time_end=2016-02-01T00:00:00 \
+            //--request GET
+            //--header "X-CoinAPI-Key: 73034021-THIS-IS-SAMPLE-KEY"
+            let base = AssetName("USD".to_owned());
+            let asset = AssetName("BTC".to_owned());
+            let period = Period::get_nearest(Duration::from_secs_f64(1.0)).unwrap();
+            let start = Utc::now();
+            let limit = 100;
+            let end = start - chrono::Duration::seconds(limit as i64);
+            let _ = api
+                .timeseries_data(base, asset, period, start, end, limit)
+                .await
+                .unwrap();
+        }
     }
 }
